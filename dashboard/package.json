@@ -1,0 +1,26 @@
+{
+  "name": "hta-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only status dashboard for the HTA trading bot.",
+  "scripts": {
+    "predev": "node scripts/copy-data.mjs",
+    "prebuild": "node scripts/copy-data.mjs",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "^16.2.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "typescript": "^5.7.0"
+  }
+}

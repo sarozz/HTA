@@ -33,3 +33,14 @@ logs/
 .vscode/
 *.swp
 .DS_Store
+
+# Dashboard (Next.js)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+dashboard/.vercel/
+# dashboard/data/ is already ignored by the `data/` rule above; its
+# contents are regenerated from reports/ by scripts/copy-data.mjs.
+dashboard/public/strategy_a_equity_curve.png
+next-env.d.ts
+*.tsbuildinfo
