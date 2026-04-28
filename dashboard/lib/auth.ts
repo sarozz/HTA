@@ -33,8 +33,19 @@ function constantTimeEqual(a: string, b: string): boolean {
 const FALLBACK_SECRET =
   "hta-static-fallback-set-NEXTAUTH_SECRET-in-vercel-env-asap-please-do-it";
 
+// Use `||` not `??` so an empty-string env var falls through to the fallback.
+// Vercel sometimes ends up with NEXTAUTH_SECRET="" which `??` would NOT replace.
 const RESOLVED_SECRET =
-  process.env.NEXTAUTH_SECRET ?? process.env.AUTH_SECRET ?? FALLBACK_SECRET;
+  (process.env.NEXTAUTH_SECRET && process.env.NEXTAUTH_SECRET.trim()) ||
+  (process.env.AUTH_SECRET && process.env.AUTH_SECRET.trim()) ||
+  FALLBACK_SECRET;
+
+// NextAuth v4 reads process.env.NEXTAUTH_SECRET directly in a few code paths
+// (e.g. JWT sign/verify) even when we pass `secret` in authOptions. If it's
+// missing or blank, force-set it so those paths work too.
+if (!process.env.NEXTAUTH_SECRET || !process.env.NEXTAUTH_SECRET.trim()) {
+  process.env.NEXTAUTH_SECRET = RESOLVED_SECRET;
+}
 
 if (
   process.env.NODE_ENV === "production" &&
