@@ -1,0 +1,64 @@
+# systemd unit for the HTA dashboard API.
+#
+# Install:
+#   sudo cp deploy/dashboard-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now dashboard-api
+#
+# The service expects:
+#   - /opt/hta/                   the bot install (this repo)
+#   - /opt/hta/.venv              a virtualenv with the project installed
+#   - /etc/hta/dashboard.env      env file containing at minimum:
+#       DASHBOARD_API_TOKEN=<long random string>
+#       HTA_JOURNAL_PATH=/var/lib/hta/journal.sqlite
+#   - hta system user             the bot's user account; reads the journal
+#
+# This unit runs the API in standalone mode — same process as the
+# trading loop is the production path; standalone is for staging /
+# diagnostics where you don't want to expose live state.
+#
+# For the production single-process path, the trading loop's own
+# scripts/run_live.py creates the bus and passes it to create_app(). This
+# unit then becomes redundant — the trading systemd unit owns the API too.
+
+[Unit]
+Description=HTA dashboard API (read-only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hta
+Group=hta
+WorkingDirectory=/opt/hta
+EnvironmentFile=/etc/hta/dashboard.env
+ExecStart=/opt/hta/.venv/bin/python -m uvicorn \
+    src.dashboard_api.main:standalone_app \
+    --host 127.0.0.1 \
+    --port 8080 \
+    --log-level info \
+    --no-access-log
+Restart=on-failure
+RestartSec=2s
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/hta
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# Resource limits — refuse to consume more than this.
+LimitNOFILE=8192
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

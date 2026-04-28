@@ -15,6 +15,10 @@ funding capture) that runs on a $1,500 account with strict risk controls.
    meant to be runnable. If something can't be done, say so out loud.
 7. NEVER place an order during a session where I haven't explicitly
    asked for one. Read-only operations are fine.
+8. NEVER modify strategy parameters at runtime based on live trading
+   results. Parameter sets are pre-validated in backtest, committed
+   to git, and selected via a deterministic regime classifier. No
+   optimisation loop runs against live PnL, ever.
 
 ## Coding standards
 - Python 3.10+, type hints everywhere, async/await for I/O.

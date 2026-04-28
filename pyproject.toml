@@ -16,6 +16,10 @@ dependencies = [
     "websockets ~= 16.0",
     "pyarrow ~= 24.0",
     "matplotlib ~= 3.10",
+    "fastapi ~= 0.136",
+    "uvicorn[standard] ~= 0.46",
+    "slowapi ~= 0.1",
+    "httpx ~= 0.28",
 ]
 
 [project.optional-dependencies]
@@ -45,8 +49,13 @@ select = ["E", "F", "I", "B", "UP", "ASYNC", "S", "RUF"]
 ignore = ["S101", "RUF001", "RUF002", "RUF003"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "S105", "S106"]
+"tests/*" = ["S101", "S105", "S106", "S603"]
 "scripts/*" = ["S105", "S106"]
+# queries.py composes SQL fragments from a fixed allowlist (event types,
+# channel names) — params are always bound. ws.py has best-effort socket
+# close cleanup where exceptions are intentionally swallowed.
+"src/dashboard_api/queries.py" = ["S608", "E501"]
+"src/dashboard_api/ws.py" = ["S110"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

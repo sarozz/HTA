@@ -38,6 +38,14 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from src.dashboard_api.bus import (
+    CHANNEL_EQUITY,
+    CHANNEL_HEARTBEAT,
+    CHANNEL_POSITION,
+    CHANNEL_RISK_EVENT,
+    CHANNEL_SIGNAL,
+    Bus,
+)
 from src.execution.capital_allocator import (
     CapitalAllocatorConfig,
     allocate,
@@ -209,8 +217,10 @@ class LiveSystem:
         capital_config: CapitalAllocatorConfig | None = None,
         funding_config: FundingCaptureConfig | None = None,
         spot_adapter: object | None = None,
+        bus: Bus | None = None,
     ) -> None:
         self._config = config
+        self._bus = bus or Bus()
         self._adapter = adapter
         self._ws = ws_client
         self._candles = candle_store
@@ -240,6 +250,10 @@ class LiveSystem:
         self._ws.stop()
         self._reconciler.stop()
 
+    @property
+    def bus(self) -> Bus:
+        return self._bus
+
     async def run(self) -> int:
         await self._journal.append(
             "live_start",
@@ -252,6 +266,7 @@ class LiveSystem:
         bar_task = asyncio.create_task(self._bar_close_loop(), name="bar-close")
         cancel_task = asyncio.create_task(self._stale_cancel_loop(), name="stale-cancel")
         funding_task = asyncio.create_task(self._funding_capture_loop(), name="funding")
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop(), name="heartbeat")
         oracle_task = (
             asyncio.create_task(self._funding_oracle.run(), name="oracle")
             if self._funding_oracle is not None
@@ -259,7 +274,15 @@ class LiveSystem:
         )
         all_tasks = [
             t
-            for t in (ws_task, rec_task, bar_task, cancel_task, funding_task, oracle_task)
+            for t in (
+                ws_task,
+                rec_task,
+                bar_task,
+                cancel_task,
+                funding_task,
+                heartbeat_task,
+                oracle_task,
+            )
             if t is not None
         ]
 
@@ -298,6 +321,57 @@ class LiveSystem:
                 await self._router.cancel_stale_orders()
             except Exception:
                 logger.exception("stale cancel pass failed")
+
+    async def _heartbeat_loop(self) -> None:
+        """Publishes equity + heartbeat ticks to the bus and journals
+        equity_tick rows so the dashboard API can render time series."""
+        import time as _time
+
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
+                return
+            except asyncio.TimeoutError:
+                pass
+            try:
+                equity = self._tracker.equity
+                positions = self._tracker.positions()
+                unrealized = sum(
+                    (p.size * (p.mark_price - p.entry_price) for p in positions),
+                    Decimal("0"),
+                )
+                payload = {
+                    "ts": _time.time(),
+                    "equity": str(equity),
+                    "realized": str(equity - unrealized),
+                    "unrealized": str(unrealized),
+                }
+                self._bus.publish(CHANNEL_EQUITY, payload)
+                self._bus.publish(
+                    CHANNEL_HEARTBEAT,
+                    {"halted": self._kill.halted, "subs": self._bus.subscriber_count},
+                )
+                # Persist the equity tick + heartbeat marker so post-hoc
+                # /api/equity and /api/health work.
+                await self._journal.append("equity_tick", payload)
+                await self._journal.upsert_state(
+                    "heartbeat",
+                    "_",
+                    {"ts": _time.time(), "halted": self._kill.halted},
+                )
+                # Update per-symbol position state.
+                for p in positions:
+                    pos_payload = {
+                        "symbol": p.symbol,
+                        "size": str(p.size),
+                        "entry_price": str(p.entry_price),
+                        "mark_price": str(p.mark_price),
+                        "liq_price": str(p.liq_price) if p.liq_price is not None else None,
+                    }
+                    self._bus.publish(CHANNEL_POSITION, pos_payload)
+                    await self._journal.upsert_state("position", p.symbol, pos_payload)
+            except Exception:
+                logger.exception("heartbeat tick failed")
 
     async def _funding_capture_loop(self) -> None:
         """Strategy B scheduler tick. Runs every 5 seconds.
@@ -453,16 +527,16 @@ class LiveSystem:
             config=self._config.to_strategy_config(),
         )
 
-        await self._journal.append(
-            "signal",
-            {
-                "symbol": symbol,
-                "bar_open_ms": latest_closed_open_ms,
-                "target_notional": str(target.notional),
-                "reason": target.reason,
-                "current_size": str(tracked.size) if tracked else "0",
-            },
-        )
+        signal_payload = {
+            "symbol": symbol,
+            "strategy": "mean_reversion",
+            "bar_open_ms": latest_closed_open_ms,
+            "target_notional": str(target.notional),
+            "reason": target.reason,
+            "current_size": str(tracked.size) if tracked else "0",
+        }
+        await self._journal.append("signal", signal_payload)
+        self._bus.publish(CHANNEL_SIGNAL, signal_payload)
 
         # Refresh tracker before submission so the delta computation uses
         # the freshest possible truth.
@@ -494,15 +568,15 @@ class LiveSystem:
             a_alloc is not None
             and abs(target.notional) > a_alloc.available_notional + a_alloc.used_notional
         ):
-            await self._journal.append(
-                "signal_suppressed",
-                {
-                    "symbol": symbol,
-                    "reason": "exceeds A's capital allocation",
-                    "wanted": str(target.notional),
-                    "available": str(a_alloc.available_notional),
-                },
-            )
+            risk_payload = {
+                "kind": "signal_suppressed",
+                "symbol": symbol,
+                "reason": "exceeds A's capital allocation",
+                "wanted": str(target.notional),
+                "available": str(a_alloc.available_notional),
+            }
+            await self._journal.append("signal_suppressed", risk_payload)
+            self._bus.publish(CHANNEL_RISK_EVENT, risk_payload)
             return
 
         await self._router.submit_target(target, strategy="mean_reversion")
@@ -551,6 +625,7 @@ async def build_system(config_path: Path) -> LiveSystem:
     candle_store = CandleStore(history=cfg.history, bar_seconds=cfg.bar_seconds)
     tracker = PositionTracker(adapter)
     tick_service = SimpleTickService(candle_store)
+    bus = Bus()
     router = OrderRouter(
         adapter=adapter,
         tracker=tracker,
@@ -558,6 +633,7 @@ async def build_system(config_path: Path) -> LiveSystem:
         tick_service=tick_service,
         journal=journal,
         stale_seconds=cfg.stale_order_seconds,
+        bus=bus,
     )
     reconciler = Reconciler(
         tracker=tracker,
@@ -582,6 +658,7 @@ async def build_system(config_path: Path) -> LiveSystem:
         # spot_adapter intentionally None — Strategy B runs in
         # observation-only mode until a spot router is wired.
         spot_adapter=None,
+        bus=bus,
     )
 
     ws_client.on(CHANNEL_TRADES, system._handle_trades)

@@ -25,6 +25,19 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts   ON events(ts_unix);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+
+-- `state` is a small materialised view of the latest value per (kind, key).
+-- The dashboard API reads this for /api/positions, /api/orderbook, /api/funding,
+-- /api/health — endpoints where 'latest snapshot' is the natural query and
+-- walking the entire events table per request would be wasteful.
+CREATE TABLE IF NOT EXISTS state (
+    kind     TEXT NOT NULL,
+    key      TEXT NOT NULL,
+    value    TEXT NOT NULL,   -- JSON blob
+    ts_unix  REAL NOT NULL,
+    PRIMARY KEY (kind, key)
+);
+CREATE INDEX IF NOT EXISTS idx_state_ts ON state(ts_unix);
 """
 
 
@@ -32,6 +45,8 @@ class JournalLike(Protocol):
     """Anything the rest of the system needs from the journal."""
 
     async def append(self, event_type: str, payload: dict[str, Any]) -> None: ...
+
+    async def upsert_state(self, kind: str, key: str, value: dict[str, Any]) -> None: ...
 
 
 class Journal:
@@ -43,6 +58,10 @@ class Journal:
         self._lock = asyncio.Lock()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path, isolation_level=None)
@@ -62,12 +81,32 @@ class Journal:
                 (ts, event_type, blob),
             )
 
+    async def upsert_state(self, kind: str, key: str, value: dict[str, Any]) -> None:
+        ts = time.time()
+        blob = json.dumps(value, default=str, sort_keys=True)
+        async with self._lock:
+            await asyncio.to_thread(self._upsert, kind, key, blob, ts)
+
+    def _upsert(self, kind: str, key: str, blob: str, ts: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO state (kind, key, value, ts_unix) VALUES (?, ?, ?, ?)
+                ON CONFLICT(kind, key) DO UPDATE SET value=excluded.value, ts_unix=excluded.ts_unix
+                """,
+                (kind, key, blob, ts),
+            )
+
 
 class InMemoryJournal:
     """Test double. Stores events in a list; same async interface."""
 
     def __init__(self) -> None:
         self.events: list[tuple[float, str, dict[str, Any]]] = []
+        self.state: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
     async def append(self, event_type: str, payload: dict[str, Any]) -> None:
         self.events.append((time.time(), event_type, dict(payload)))
+
+    async def upsert_state(self, kind: str, key: str, value: dict[str, Any]) -> None:
+        self.state[(kind, key)] = (time.time(), dict(value))

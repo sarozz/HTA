@@ -74,10 +74,12 @@ class OrderRouter:
         *,
         stale_seconds: float = 60.0,
         clock: Any = time.monotonic,
+        bus: Any = None,
     ) -> None:
         self._adapter = adapter
         self._tracker = tracker
         self._kill_switch = kill_switch
+        self._bus = bus  # optional dashboard_api.bus.Bus; publishes fills
         self._ticks = tick_service
         self._journal = journal
         self._stale_seconds = stale_seconds
@@ -269,7 +271,9 @@ class OrderRouter:
         )
         if result.accepted and result.oid is not None:
             self._record_submission(intent, result)
-            await self._journal.append("order_submitted", _result_to_dict(intent, result))
+            payload = _result_to_dict(intent, result)
+            await self._journal.append("order_submitted", payload)
+            self._publish_fill(payload, opens_or_closes="open")
             return
 
         if result.error_code != "alo_would_take":
@@ -301,10 +305,9 @@ class OrderRouter:
         )
         if retry.accepted and retry.oid is not None:
             self._record_submission(retry_intent, retry)
-            await self._journal.append(
-                "order_submitted_after_retry",
-                _result_to_dict(retry_intent, retry),
-            )
+            payload = _result_to_dict(retry_intent, retry)
+            await self._journal.append("order_submitted_after_retry", payload)
+            self._publish_fill(payload, opens_or_closes="open")
             return
 
         await self._journal.append(
@@ -327,6 +330,33 @@ class OrderRouter:
             submitted_at_monotonic=self._clock(),
         )
         self._recent_submissions.append(time.time())
+
+    def _publish_fill(self, payload: dict[str, Any], *, opens_or_closes: str) -> None:
+        """Publish to the bus if one is wired, else no-op.
+
+        We don't yet ingest real fill events from the user-fills WS, so
+        this is the best signal we have that an order is "live": it was
+        accepted by the exchange and is now resting. The bus message
+        carries opens_or_closes so the dashboard's trade reconstructor
+        can pair entries with exits later.
+        """
+        if self._bus is None:
+            return
+        try:
+            self._bus.publish(
+                "fill",
+                {
+                    "symbol": payload.get("symbol"),
+                    "side": payload.get("side"),
+                    "size": payload.get("size"),
+                    "price": payload.get("price"),
+                    "strategy": payload.get("strategy"),
+                    "oid": payload.get("oid"),
+                    "opens_or_closes": opens_or_closes,
+                },
+            )
+        except Exception:
+            logger.exception("bus.publish failed (non-fatal)")
 
 
 def _intent_to_dict(intent: OrderIntent) -> dict[str, Any]:

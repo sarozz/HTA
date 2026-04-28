@@ -1,0 +1,81 @@
+# Caddy fronts the HTA dashboard API on the bot host.
+#
+# Responsibilities:
+#   - HTTPS termination via Let's Encrypt.
+#   - Bearer-token check at the edge so unauthenticated requests never
+#     reach uvicorn (defence in depth — FastAPI also enforces it).
+#   - Per-IP rate limit (60 rps) shared with slowapi inside the app.
+#   - Localhost-only upstream: uvicorn binds to 127.0.0.1:8080.
+#
+# Replace the hostname and email below before deploying. The
+# DASHBOARD_API_TOKEN must match what the bot process sees in its env.
+#
+# Install: place this file at /etc/caddy/Caddyfile, then:
+#   sudo systemctl reload caddy
+
+{
+    email ops@example.com
+    # The rate_limit module is a third-party plugin; install it with
+    # `xcaddy build --with github.com/mholt/caddy-ratelimit` if you
+    # want this to take effect. Without the plugin the directives below
+    # are silently ignored and slowapi inside FastAPI provides the only
+    # per-IP rate limit.
+    order rate_limit before reverse_proxy
+}
+
+dashboard.bot.example.com {
+    # Block every method except GET on the API surface. The dashboard
+    # is read-only; any mutating verb is a configuration error.
+    @write_methods method POST PUT PATCH DELETE
+    respond @write_methods 405
+
+    # Per-IP rate limit (requires caddy-ratelimit plugin).
+    rate_limit {
+        zone api {
+            key {client_ip}
+            events 60
+            window 60s
+        }
+    }
+
+    # Edge auth: require the Authorization header to be present and to
+    # start with "Bearer ". The exact comparison happens inside the app
+    # (constant-time) — at the edge we just bounce obviously-anonymous
+    # requests so they never wake uvicorn.
+    @missing_bearer not header Authorization "Bearer *"
+    handle /api/* {
+        @missing_bearer_api not header Authorization "Bearer *"
+        respond @missing_bearer_api 401 {
+            body "missing bearer token"
+            close
+        }
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    handle /ws {
+        # WebSocket upgrade. The token comes via ?token=... query param.
+        # The app validates it before accepting the upgrade.
+        reverse_proxy 127.0.0.1:8080 {
+            transport http {
+                read_timeout 0
+                write_timeout 0
+            }
+        }
+    }
+
+    handle / {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    encode gzip
+    log {
+        output file /var/log/caddy/dashboard-api.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+        # Don't log the Authorization header — value is the bearer token.
+        format json {
+            time_format iso8601
+        }
+    }
+}
