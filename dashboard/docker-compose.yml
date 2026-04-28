@@ -1,0 +1,47 @@
+# Local dev stack: mock bot API + Next.js dashboard, no live exchange.
+#
+#   docker compose up        # starts both services
+#   docker compose up dashboard
+#   docker compose down
+#
+# Visit http://localhost:3000 ; default password is "operator" (sha256
+# baked into .env.example so the login page works out of the box).
+
+services:
+  mock-api:
+    image: python:3.12-slim
+    working_dir: /app
+    volumes:
+      - ./mock_api:/app/mock_api:ro
+    environment:
+      DASHBOARD_API_TOKEN: local-dev-token-do-not-use-in-prod
+    command: >-
+      sh -c "pip install --quiet fastapi uvicorn[standard] &&
+             uvicorn mock_api.server:app --host 0.0.0.0 --port 8080"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/').read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  dashboard:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+      - /app/node_modules
+      - /app/.next
+    environment:
+      HTA_API_URL: http://mock-api:8080
+      HTA_API_TOKEN: local-dev-token-do-not-use-in-prod
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: dev-only-not-for-production
+      DASHBOARD_PASSWORD_SHA256: 8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918
+    command: sh -c "npm install --no-audit --no-fund && npm run dev"
+    ports:
+      - "3000:3000"
+    depends_on:
+      mock-api:
+        condition: service_healthy

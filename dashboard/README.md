@@ -1,78 +1,142 @@
-# HTA dashboard
+# HTA dashboard (Next.js)
 
-Read-only status page for the HTA trading bot. Built with Next.js (App
-Router) and deployed on Vercel.
+Real-time read-only operator dashboard for the HTA Hyperliquid trading
+bot. Bloomberg-density layout, dark-first, single page, no
+navigation. Connects to the bot's `dashboard_api` (FastAPI/uvicorn).
 
-The trading bot itself (`src/`) is a long-running Python process and
-**cannot run on Vercel** — it needs persistent connections, background
-workers, and on-disk state. This dashboard is a static site that:
+## Stack
 
-- Renders the latest backtest report committed to `reports/` in the repo
-- Embeds the equity-curve PNG as a chart card
-- Shows a placeholder for live-bot status (not wired up yet)
+- Next.js 14 (App Router) + TypeScript strict
+- Tailwind CSS with a custom dark theme (token mapping in
+  `tailwind.config.ts`)
+- NextAuth credentials provider (single-operator password)
+- SWR for REST polling (3s default)
+- Zustand for client UI state
+- Recharts for the equity curve
+- Framer Motion for transitions (subtle)
+- Vitest for tests (bundle-redaction is the load-bearing one)
 
-## Vercel project settings
+## Local dev — offline (recommended for UI work)
 
-When you create / configure the Vercel project for this repo, set:
-
-| Setting | Value |
-| --- | --- |
-| Framework Preset | Next.js (auto-detected) |
-| **Root Directory** | `dashboard` |
-| Build Command | `npm run build` (default) |
-| Output Directory | `.next` (default) |
-| Install Command | `npm install` (default) |
-| Node.js Version | 22.x (matches local) |
-
-The **Root Directory** setting is the important one — without it, Vercel
-will try to build from the repo root and fail because the root is a
-Python project, not a Node project.
-
-### Branch behaviour
-
-By default Vercel:
-- Builds and deploys the **production** branch (usually `main`) to the
-  primary domain
-- Builds **preview** deploys for every other branch / PR
-
-If you want this branch (`claude/setup-hyperliquid-trading-eJAME`) to
-go to production, either merge it to `main` or change the Vercel
-project's Production Branch setting.
-
-## Local development
+The mock bot API and the dashboard run together via docker-compose:
 
 ```bash
 cd dashboard
-npm install
-npm run dev   # http://localhost:3000
+docker compose up
+# open http://localhost:3000
+# login password: operator
 ```
 
-The `predev` and `prebuild` scripts copy `reports/strategy_a_backtest.md`
-and `reports/strategy_a_equity_curve.png` from the repo into
-`dashboard/data/` and `dashboard/public/` so the page has data to render.
-If those files don't exist (no backtest run yet), the page falls back to
-a placeholder; nothing crashes.
-
-To regenerate the report, run from the repo root:
+If you don't have docker, run them separately:
 
 ```bash
-python -m scripts.run_backtest_synthetic    # synthetic 60-day demo
-# or, with network access to Hyperliquid:
-python -m scripts.run_backtest               # real 180-day pull
+# terminal 1 — mock bot API
+DASHBOARD_API_TOKEN=local-dev-token-do-not-use-in-prod \
+  uvicorn mock_api.server:app --host 127.0.0.1 --port 8080
+
+# terminal 2 — Next.js
+cp .env.example .env.local
+pnpm install   # or npm
+pnpm dev       # http://localhost:3000
 ```
 
-Then re-run `npm run build` (or the prebuild step alone:
-`node scripts/copy-data.mjs`) to refresh the dashboard's copy.
+## Local dev — against the real bot
 
-## What this dashboard is NOT
+Point `HTA_API_URL` at the bot host and use the real bearer token. With
+Caddy in front of the bot, that's typically `https://dashboard.bot.example.com`:
 
-- It does NOT show live positions, fills, or P&L. The bot is not yet
-  deployed and there is no API for the dashboard to query.
-- It does NOT trigger trades. Read-only by design.
-- It does NOT host the bot. The bot needs a persistent host (your
-  laptop, a VPS, Fly.io, Railway, Render, etc.).
+```bash
+export HTA_API_URL=https://dashboard.bot.example.com
+export HTA_API_TOKEN=<the long random token from /etc/hta/dashboard.env>
+pnpm dev
+```
 
-When the bot is running and reachable, a future iteration can add
-`/api/*` routes (Vercel serverless functions) that proxy to the bot's
-HTTP API or read from a hosted database (Neon, Supabase, etc.) the bot
-writes to.
+## Auth model
+
+There is **one operator password**, stored as its SHA-256 hash in
+`DASHBOARD_PASSWORD_SHA256`. To rotate:
+
+```bash
+echo -n "your-new-password" | shasum -a 256 | awk '{print $1}'
+# put that in .env.local (or Vercel env)
+```
+
+`NEXTAUTH_SECRET` should be a long random string, generated once
+per deployment:
+
+```bash
+openssl rand -base64 32
+```
+
+The bot's bearer token (`HTA_API_TOKEN`) lives in **server env only**.
+Browser code never sees it — every call goes through `/api/proxy/*`
+which is gated by NextAuth and adds the bearer header server-side. The
+`test/redact.test.ts` Vitest test scans the built static bundle for any
+trace of the token name and fails the build if anything leaks.
+
+## Vercel deployment
+
+The Vercel project should:
+
+| Setting | Value |
+| --- | --- |
+| **Root Directory** | `dashboard` |
+| Framework Preset | Next.js (auto) |
+| Region | `sin1` (Singapore — Asia, configured in `vercel.json`) |
+| Node.js Version | 22.x |
+
+Required env vars (Production + Preview):
+
+| Var | What |
+| --- | --- |
+| `HTA_API_URL` | `https://dashboard.bot.example.com` (your bot+Caddy URL) |
+| `HTA_API_TOKEN` | bearer token (matches the bot's `DASHBOARD_API_TOKEN`) |
+| `NEXTAUTH_URL` | `https://dashboard.example.com` (Vercel-assigned URL or custom domain) |
+| `NEXTAUTH_SECRET` | `openssl rand -base64 32` |
+| `DASHBOARD_PASSWORD_SHA256` | sha256 of operator password |
+
+Push to the branch Vercel watches; deploy fires automatically. The
+dashboard will not work until the bot host is reachable from Vercel —
+verify with `curl -H "Authorization: Bearer <token>" $HTA_API_URL/api/health`
+from any internet host first.
+
+## Deliberate gaps (next session)
+
+This session ships the foundation + Rows 1 / 4 fully built and Rows
+2 / 3 wired with placeholders that hold their grid space at the
+correct density. The next session fills in:
+
+- Live price chart (lightweight-charts, /ws tick channel)
+- Orderbook heatmap (D3, 10fps throttle)
+- Trade markers on the price chart
+- WS data flow (currently using SWR polling at 3s; spec calls for WS
+  with snapshot + delta and a polling fallback. The polling fallback
+  is what's running today)
+- TanStack Virtual on the trades table (currently caps display at 500
+  rows — fine for now, will overflow at 10k+ rows on a long session)
+- Playwright smoke
+- Bundle-size budget assertion (< 350KB gzipped)
+
+## Hard constraints (don't relax these without thought)
+
+- **Read-only.** No POST/PUT/PATCH/DELETE in the proxy or anywhere in
+  the UI. If you ever want a halt button: refuse, and send a Telegram
+  command instead.
+- **No bearer token in the browser.** Every fetch goes through
+  `/api/proxy/*`. The redaction test fails the build if anything leaks.
+- **No NEXT_PUBLIC_*** env vars touch tokens / URLs. Add them only for
+  truly-public values (none today).
+- **Read-only WS.** The WS client (when wired next session) refuses to
+  send anything other than `{action: "subscribe", ...}`. The bot enforces
+  this server-side too.
+
+## Tests
+
+```bash
+# Build first; the redaction test scans .next/static/**
+HTA_API_TOKEN=ZZ-REDACTION-CANARY-XXX-9b41d pnpm build
+pnpm test
+```
+
+If the redaction test fails, the bundle is leaking server env. Fix
+before merging.

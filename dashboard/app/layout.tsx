@@ -2,9 +2,13 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "HTA — Hyperliquid Algo Trading",
-  description:
-    "Read-only status dashboard for the HTA trading bot (mean reversion + funding capture).",
+  title: "HTA — Trading Dashboard",
+  description: "Read-only operator dashboard for the HTA Hyperliquid trading bot.",
+  robots: { index: false, follow: false },
+};
+
+export const viewport = {
+  themeColor: "#0A0E14",
 };
 
 export default function RootLayout({
@@ -13,8 +17,8 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body>{children}</body>
+    <html lang="en" className="dark">
+      <body className="antialiased min-h-screen">{children}</body>
     </html>
   );
 }
