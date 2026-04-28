@@ -38,7 +38,7 @@ services:
       HTA_API_TOKEN: local-dev-token-do-not-use-in-prod
       NEXTAUTH_URL: http://localhost:3000
       NEXTAUTH_SECRET: dev-only-not-for-production
-      DASHBOARD_PASSWORD_SHA256: 8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918
+      DASHBOARD_PASSWORD_SHA256: 06e55b633481f7bb072957eabcf110c972e86691c3cfedabe088024bffe42f23
     command: sh -c "npm install --no-audit --no-fund && npm run dev"
     ports:
       - "3000:3000"

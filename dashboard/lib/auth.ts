@@ -50,7 +50,7 @@ if (
 // Resolve the password hash. If unset, default to the sha256 of "operator"
 // so a fresh deploy without env vars is at least usable. Override in env.
 const FALLBACK_PASSWORD_HASH =
-  "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"; // sha256 of "operator"
+  "06e55b633481f7bb072957eabcf110c972e86691c3cfedabe088024bffe42f23"; // sha256 of "operator"
 
 export const authOptions: NextAuthOptions = {
   secret: RESOLVED_SECRET,
