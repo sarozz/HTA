@@ -1,0 +1,114 @@
+# Annotated example config for the Hyperliquid algo trading system.
+# Copy to config/local.yaml (gitignored) and edit. Values here are the
+# defaults from SPEC.md and RISK.md; do not change risk caps without
+# also updating RISK.md.
+
+network:
+  # "testnet" or "mainnet". Code defaults to testnet; mainnet must be
+  # explicit. The check_connection.py script always uses testnet.
+  name: testnet
+  testnet_url: https://api.hyperliquid-testnet.xyz
+  mainnet_url: https://api.hyperliquid.xyz
+
+# ---------------------------------------------------------------------------
+# Strategy A: Intraday Mean Reversion
+# ---------------------------------------------------------------------------
+mean_reversion:
+  enabled: true
+  universe: ["BTC-PERP", "ETH-PERP", "SOL-PERP"]
+  timeframe: 5m
+
+  # Features (lagged by one bar in simulator)
+  sma_window: 96         # SMA window for z-score (96 bars * 5m = 8h)
+  stdev_window: 96       # STDEV window for z-score
+  rsi_window: 14         # RSI lookback
+
+  # Entry thresholds
+  z_entry_long: -2.0     # LONG when z_score < this AND rsi < rsi_oversold
+  z_entry_short: 2.0     # SHORT when z_score > this AND rsi > rsi_overbought
+  rsi_oversold: 30
+  rsi_overbought: 70
+
+  # Order behaviour
+  order_type: ALO        # post-only limit at the touch
+  alo_retry_count: 1     # retry once with one tick of price improvement
+  alo_retry_tick_offset: 1
+
+  # Exits (whichever fires first)
+  z_target: 0.0          # |z_score| crosses 0
+  z_stop: 3.5            # |z_score| > this -> stop
+  time_stop_bars: 4      # close after N bars in position
+
+  # Sizing (also bounded by risk caps below)
+  risk_per_trade_pct: 0.005     # 0.5% of equity
+  max_notional_pct: 0.30        # 30% of equity
+
+# ---------------------------------------------------------------------------
+# Strategy B: Funding Rate Capture
+# ---------------------------------------------------------------------------
+funding_capture:
+  enabled: true
+  universe: ["BTC", "ETH", "SOL"]   # must have both spot and perp
+
+  # Trigger
+  predicted_funding_threshold: 0.001   # 0.10% per 1h funding tick
+
+  # Execution timing (seconds)
+  pre_funding_entry_seconds: 600       # place legs 10 minutes before tick
+  fill_window_seconds: 90              # both legs must fill within 90s
+  post_funding_exit_min_seconds: 60    # close 1-2 minutes after tick
+  post_funding_exit_max_seconds: 120
+
+  # Sizing
+  max_notional_pct_per_leg: 0.50       # up to 50% of free margin per leg
+
+  # Profitability gate (round-trip cost, in fraction)
+  # 4 x 0.015% maker = 6 bps; threshold 10 bps gives 4 bps safety margin
+  round_trip_cost: 0.0006
+
+# ---------------------------------------------------------------------------
+# Risk Manager (HARD CAPS — see RISK.md)
+# ---------------------------------------------------------------------------
+risk:
+  # Per-trade caps
+  max_risk_per_trade_pct: 0.005        # 0.5% of equity
+  max_position_notional_pct: 0.30      # 30% of equity
+  max_account_leverage: 3.0            # 3x
+  liquidation_buffer_pct: 0.08         # >= 8% from current mark
+
+  # Concurrency caps
+  max_concurrent_positions: 2          # one per strategy
+  max_open_orders: 6
+  max_orders_per_minute: 20
+
+  # Loss limits (auto-halt)
+  daily_loss_limit_pct: 0.02           # 2% of equity, resets 00:00 UTC
+  weekly_loss_limit_pct: 0.05          # 5%, manual resume required
+  consecutive_losers_pause: 3          # 3 losers -> 1h pause
+  consecutive_losers_pause_minutes: 60
+
+  # Session safety
+  session_equity_floor_pct: 0.90       # halt if equity < 90% of session start
+
+  # Failure-mode triggers
+  websocket_silence_seconds: 30        # WS silent > 30s -> halt
+  consecutive_order_rejections: 3      # 3 rejections in a row -> halt
+
+# ---------------------------------------------------------------------------
+# Reconciler
+# ---------------------------------------------------------------------------
+reconciler:
+  interval_seconds: 30                 # query exchange every 30s
+
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
+storage:
+  sqlite_path: data/journal.sqlite     # JSON-blob journal for orders/fills/signals/errors
+
+# ---------------------------------------------------------------------------
+# Notify
+# ---------------------------------------------------------------------------
+notify:
+  telegram:
+    enabled: false                     # turn on once TELEGRAM_* env vars set
