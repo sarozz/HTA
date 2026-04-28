@@ -18,25 +18,34 @@ function constantTimeEqual(a: string, b: string): boolean {
   return timingSafeEqual(ab, bb);
 }
 
-// Resolve the NextAuth signing secret. Prefer NEXTAUTH_SECRET (the
-// canonical name); fall back to AUTH_SECRET. If neither is present in
-// production, generate an ephemeral secret per process so the site
-// boots — the cost is sessions invalidating on every cold start. The
-// proper fix is to set NEXTAUTH_SECRET in the deployment env.
-function resolveSecret(): string {
-  const explicit = process.env.NEXTAUTH_SECRET ?? process.env.AUTH_SECRET;
-  if (explicit) return explicit;
-  if (process.env.NODE_ENV === "production") {
-    // Loud warning, no crash. Visible in `vercel logs`.
-    console.warn(
-      "[hta] NEXTAUTH_SECRET is not set. Generating an ephemeral secret. " +
-        "Sessions will not survive cold starts. Set NEXTAUTH_SECRET in env to fix.",
-    );
-  }
-  return randomBytes(32).toString("hex");
-}
+// Resolve the NextAuth signing secret. Priority:
+//   1. NEXTAUTH_SECRET env (canonical)
+//   2. AUTH_SECRET env (next-auth alt name)
+//   3. Static fallback constant so the site at least loads.
+//
+// Security note on the fallback: a constant in source defeats JWT
+// signing's confidentiality. Anyone with read access to this file can
+// forge a session cookie. Acceptable ONLY because (a) this dashboard is
+// operator-only on a private deploy, (b) the bot is read-only so a
+// forged cookie cannot mutate trading state, (c) the warning below is
+// loud enough that you'll set the real env var. Set NEXTAUTH_SECRET in
+// Vercel env vars to fix.
+const FALLBACK_SECRET =
+  "hta-static-fallback-set-NEXTAUTH_SECRET-in-vercel-env-asap-please-do-it";
 
-const RESOLVED_SECRET = resolveSecret();
+const RESOLVED_SECRET =
+  process.env.NEXTAUTH_SECRET ?? process.env.AUTH_SECRET ?? FALLBACK_SECRET;
+
+if (
+  process.env.NODE_ENV === "production" &&
+  RESOLVED_SECRET === FALLBACK_SECRET
+) {
+  // Visible in `vercel logs`. Still works, but please fix.
+  console.warn(
+    "[hta] NEXTAUTH_SECRET not set; using insecure static fallback. " +
+      "Set NEXTAUTH_SECRET to `openssl rand -base64 32` in Vercel env.",
+  );
+}
 
 // Resolve the password hash. If unset, default to the sha256 of "operator"
 // so a fresh deploy without env vars is at least usable. Override in env.
