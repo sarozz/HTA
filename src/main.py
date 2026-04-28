@@ -38,7 +38,15 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from src.execution.capital_allocator import (
+    CapitalAllocatorConfig,
+    allocate,
+)
+from src.execution.capital_allocator import (
+    default_config as default_allocator_config,
+)
 from src.execution.exchange_adapter import HyperliquidExchangeAdapter
+from src.execution.funding_rate_oracle import FundingRateOracle
 from src.execution.order_router import OrderRouter
 from src.execution.position_tracker import PositionTracker
 from src.execution.reconciler import Reconciler
@@ -52,6 +60,15 @@ from src.marketdata.ws_client import (
 from src.notify.telegram import TelegramNotifier
 from src.risk.kill_switch import KillSwitch
 from src.storage.journal import Journal, JournalLike
+from src.strategies.funding_capture import (
+    AccountSnapshot,
+    FundingCaptureConfig,
+    FundingCaptureDecision,
+    FundingCaptureSymbolState,
+)
+from src.strategies.funding_capture import (
+    evaluate as evaluate_funding,
+)
 from src.strategies.mean_reversion import (
     MeanReversionConfig,
     StrategyPosition,
@@ -164,7 +181,18 @@ class LiveConfig:
 
 
 class LiveSystem:
-    """Holds all the wired components and runs the loop."""
+    """Holds all the wired components and runs the loop.
+
+    Two strategies coexist:
+      - mean_reversion (Strategy A): bar-close evaluation on 5m candles
+      - funding_capture (Strategy B): time-based scheduler around hourly
+        funding ticks; PERP-ONLY ROUTING IS DISABLED until a spot
+        adapter exists (we never send unhedged orders per SPEC).
+
+    Capital is split via CapitalAllocator: A=25%, B=50%, buffer=25%.
+    Per-strategy used notional is tracked locally because the exchange
+    only knows the net per-coin position.
+    """
 
     def __init__(
         self,
@@ -177,6 +205,10 @@ class LiveSystem:
         router: OrderRouter,
         reconciler: Reconciler,
         journal: JournalLike,
+        funding_oracle: FundingRateOracle | None = None,
+        capital_config: CapitalAllocatorConfig | None = None,
+        funding_config: FundingCaptureConfig | None = None,
+        spot_adapter: object | None = None,
     ) -> None:
         self._config = config
         self._adapter = adapter
@@ -189,6 +221,19 @@ class LiveSystem:
         self._journal = journal
         self._symbol_state: dict[str, _SymbolState] = {s: _SymbolState() for s in config.symbols}
         self._stop_event = asyncio.Event()
+
+        # Strategy A's used notional, indexed by coin. Updated whenever A
+        # opens or closes a position. Used by the capital allocator.
+        self._a_used_notional: Decimal = Decimal("0")
+
+        # Strategy B state
+        self._funding_oracle = funding_oracle
+        self._capital_config = capital_config or default_allocator_config()
+        self._funding_config = funding_config or FundingCaptureConfig()
+        self._funding_state: dict[str, FundingCaptureSymbolState] = {
+            coin: FundingCaptureSymbolState(coin=coin) for coin in config.symbols
+        }
+        self._spot_adapter = spot_adapter  # None until spot routing is wired
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -206,13 +251,24 @@ class LiveSystem:
         rec_task = asyncio.create_task(self._reconciler.run(), name="reconciler")
         bar_task = asyncio.create_task(self._bar_close_loop(), name="bar-close")
         cancel_task = asyncio.create_task(self._stale_cancel_loop(), name="stale-cancel")
+        funding_task = asyncio.create_task(self._funding_capture_loop(), name="funding")
+        oracle_task = (
+            asyncio.create_task(self._funding_oracle.run(), name="oracle")
+            if self._funding_oracle is not None
+            else None
+        )
+        all_tasks = [
+            t
+            for t in (ws_task, rec_task, bar_task, cancel_task, funding_task, oracle_task)
+            if t is not None
+        ]
 
         try:
             await self._stop_event.wait()
         finally:
-            for t in (ws_task, rec_task, bar_task, cancel_task):
+            for t in all_tasks:
                 t.cancel()
-            for t in (ws_task, rec_task, bar_task, cancel_task):
+            for t in all_tasks:
                 with suppress(asyncio.CancelledError):
                     await t
             await self._journal.append("live_stop", {})
@@ -242,6 +298,109 @@ class LiveSystem:
                 await self._router.cancel_stale_orders()
             except Exception:
                 logger.exception("stale cancel pass failed")
+
+    async def _funding_capture_loop(self) -> None:
+        """Strategy B scheduler tick. Runs every 5 seconds.
+
+        At each tick:
+          1. Pull the latest funding rates from the oracle (read-only cache).
+          2. Compute capital allocation given A and B's current usage.
+          3. Run the funding-capture state machine for each coin.
+          4. Dispatch decisions; suppress order placement if the spot
+             adapter is not wired (avoid unhedged perp exposure).
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=5.0)
+                return
+            except asyncio.TimeoutError:
+                pass
+            if self._kill.halted:
+                continue
+            try:
+                await self._funding_capture_tick()
+            except Exception:
+                logger.exception("funding capture tick failed")
+
+    async def _funding_capture_tick(self) -> None:
+        rates = self._funding_oracle.latest if self._funding_oracle else {}
+        if not rates and not any(s.phase != "idle" for s in self._funding_state.values()):
+            return  # nothing to do
+        equity = self._tracker.equity if self._tracker.equity > 0 else Decimal("1500")
+        b_used = sum(
+            (abs(s.target_notional) for s in self._funding_state.values()),
+            Decimal("0"),
+        )
+        allocations = allocate(
+            equity=equity,
+            used_by_strategy={
+                "mean_reversion": self._a_used_notional,
+                "funding_capture": b_used,
+            },
+            config=self._capital_config,
+        )
+        b_alloc = allocations.get("funding_capture")
+        if b_alloc is None:
+            return
+
+        account = AccountSnapshot(
+            equity=equity,
+            available_notional_for_strategy=b_alloc.available_notional,
+        )
+        from datetime import datetime as _dt
+        from datetime import timezone as _tz
+
+        now = _dt.now(_tz.utc)
+        decisions = evaluate_funding(
+            now=now,
+            funding_rates=rates,
+            account=account,
+            states=self._funding_state,
+            config=self._funding_config,
+        )
+        for decision in decisions:
+            self._funding_state[decision.coin] = decision.next_state
+            await self._dispatch_funding_decision(decision, b_alloc.degraded)
+
+    async def _dispatch_funding_decision(
+        self, decision: FundingCaptureDecision, degraded: bool
+    ) -> None:
+        if decision.perp_target is None and decision.spot_target is None:
+            return
+        # Always journal the decision so we can reconstruct what the
+        # scheduler was thinking even when we suppress order placement.
+        await self._journal.append(
+            "funding_capture_decision",
+            {
+                "coin": decision.coin,
+                "phase": decision.next_state.phase,
+                "perp_target_notional": (
+                    str(decision.perp_target.notional) if decision.perp_target else None
+                ),
+                "spot_target_notional": (
+                    str(decision.spot_target.notional) if decision.spot_target else None
+                ),
+                "reason": decision.reason,
+                "capital_degraded": degraded,
+            },
+        )
+        if self._spot_adapter is None:
+            # Safety: no spot route → never send the perp leg either.
+            # Strategy B runs in observation-only mode until spot wires.
+            await self._journal.append(
+                "funding_capture_skipped",
+                {
+                    "coin": decision.coin,
+                    "reason": (
+                        "spot adapter not wired; suppressing perp leg to " "avoid unhedged exposure"
+                    ),
+                },
+            )
+            return
+        # Spot is wired (future): submit both legs.
+        if decision.perp_target is not None:
+            await self._router.submit_target(decision.perp_target, strategy="funding_capture")
+        # NOTE: spot routing goes here once the spot router lands.
 
     async def _maybe_evaluate_symbol(self, symbol: str) -> None:
         if self._kill.halted:
@@ -313,7 +472,43 @@ class LiveSystem:
             logger.exception("tracker refresh before submission failed")
             return
 
+        # Apply Strategy A's capital cap. The router still calls
+        # check_order, but we additionally throttle entries here so the
+        # allocator's degrade contract is honoured before the order even
+        # reaches the risk manager.
+        equity = self._tracker.equity if self._tracker.equity > 0 else Decimal("1500")
+        b_used = sum(
+            (abs(s.target_notional) for s in self._funding_state.values()),
+            Decimal("0"),
+        )
+        allocations = allocate(
+            equity=equity,
+            used_by_strategy={
+                "mean_reversion": self._a_used_notional,
+                "funding_capture": b_used,
+            },
+            config=self._capital_config,
+        )
+        a_alloc = allocations.get("mean_reversion")
+        if (
+            a_alloc is not None
+            and abs(target.notional) > a_alloc.available_notional + a_alloc.used_notional
+        ):
+            await self._journal.append(
+                "signal_suppressed",
+                {
+                    "symbol": symbol,
+                    "reason": "exceeds A's capital allocation",
+                    "wanted": str(target.notional),
+                    "available": str(a_alloc.available_notional),
+                },
+            )
+            return
+
         await self._router.submit_target(target, strategy="mean_reversion")
+        # Track A's used notional locally (the exchange returns net per coin
+        # which we can't disambiguate from B once both are live).
+        self._a_used_notional = abs(target.notional)
 
     # --- handlers wired by the factory ----------------------------------
 
@@ -372,6 +567,7 @@ async def build_system(config_path: Path) -> LiveSystem:
     )
 
     ws_client = HyperliquidWsClient(TESTNET_WS_URL, cfg.symbols)
+    funding_oracle = FundingRateOracle(info=info, coins=cfg.symbols)
     system = LiveSystem(
         config=cfg,
         adapter=adapter,
@@ -382,6 +578,10 @@ async def build_system(config_path: Path) -> LiveSystem:
         router=router,
         reconciler=reconciler,
         journal=journal,
+        funding_oracle=funding_oracle,
+        # spot_adapter intentionally None — Strategy B runs in
+        # observation-only mode until a spot router is wired.
+        spot_adapter=None,
     )
 
     ws_client.on(CHANNEL_TRADES, system._handle_trades)
