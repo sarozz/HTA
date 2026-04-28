@@ -11,6 +11,9 @@ dependencies = [
     "hyperliquid-python-sdk",
     "python-dotenv",
     "pyyaml",
+    "pandas ~= 3.0",
+    "numpy ~= 2.4",
+    "websockets ~= 16.0",
 ]
 
 [project.optional-dependencies]
